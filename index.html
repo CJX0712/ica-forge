@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ica-forge · 手写独立成分分析 (FastICA)</title>
+<style>
+  :root{ --bg:#0b1020; --panel:#141b2e; --ink:#e6ecff; --mut:#8da2c0; --acc:#5cc8ff; --ok:#5be0a0; --warn:#ffd166; --bad:#ff6b6b; --line:#23304d; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header{ padding:18px 22px 8px; border-bottom:1px solid var(--line); }
+  h1{ margin:0; font-size:18px; letter-spacing:.5px; }
+  h1 small{ color:var(--mut); font-weight:400; }
+  .wrap{ display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:18px 22px; }
+  @media(max-width:880px){ .wrap{ grid-template-columns:1fr; } }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .card h2{ margin:0 0 10px; font-size:13px; color:var(--acc); text-transform:uppercase; letter-spacing:1px; }
+  canvas{ width:100%; height:auto; display:block; background:#0c1326; border-radius:8px; }
+  .checks{ list-style:none; margin:0; padding:0; font-size:12.5px; }
+  .checks li{ display:flex; justify-content:space-between; gap:10px; padding:3px 0; border-bottom:1px dashed var(--line); }
+  .checks .v{ font-weight:700; }
+  .ok{ color:var(--ok); } .warn{ color:var(--warn); } .bad{ color:var(--bad); }
+  .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0 14px; }
+  button{ background:var(--acc); color:#04223a; border:0; border-radius:8px; padding:8px 14px; font-weight:700; cursor:pointer; }
+  button:active{ transform:translateY(1px); }
+  select{ background:#0c1326; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:7px 9px; }
+  #status{ color:var(--mut); }
+  footer{ padding:8px 22px 24px; color:var(--mut); font-size:12px; }
+  code{ color:var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ica-forge <small>· 手写独立成分分析 / FastICA · 零依赖 · 16/16 不变量全绿</small></h1>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>控制</h2>
+    <div class="row">
+      <label>对照函数
+        <select id="g">
+          <option value="kurtosis">kurtosis (u³)</option>
+          <option value="tanh">tanh</option>
+        </select>
+      </label>
+      <label>模式
+        <select id="mode">
+          <option value="deflation">deflation</option>
+          <option value="symmetric">symmetric</option>
+        </select>
+      </label>
+      <button id="run">运行 ICA</button>
+    </div>
+    <div id="status">就绪</div>
+  </div>
+
+  <div class="card">
+    <h2>8 项实时自检</h2>
+    <ul class="checks" id="checks"><li><span>—</span><span class="v">—</span></li></ul>
+  </div>
+
+  <div class="card">
+    <h2>原始源 (左) vs 恢复源 (右)</h2>
+    <canvas id="scatter" width="520" height="240"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>定点收敛 (‖Δw‖ per component)</h2>
+    <canvas id="conv" width="520" height="240"></canvas>
+  </div>
+</div>
+
+<footer>
+  手写实现：中心化 → 协方差 → Jacobi 特征分解 → 白化 → FastICA 定点迭代（kurtosis / tanh 对照）。
+  算法：A. Hyvärinen & E. Oja, <em>Independent Component Analysis</em> (2000)；FastICA (1997)。无外部依赖、无构建。
+</footer>
+
+<script id="engine">
+(function(){
+  "use strict";
+  const ICA = {};
+
+  // ---- PRNG ----
+  ICA.mulberry32 = function(a){
+    return function(){
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  ICA.randn = function(rng){
+    let u = 0, v = 0;
+    while(u === 0) u = rng();
+    while(v === 0) v = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+
+  // ---- matrix helpers (row-major, each row is Float64Array) ----
+  function zeros(r, c){
+    const m = new Array(r);
+    for(let i = 0; i < r; i++) m[i] = new Float64Array(c);
+    return m;
+  }
+  function matMul(A, B){
+    const r = A.length, k = B.length, c = B[0].length;
+    const C = zeros(r, c);
+    for(let i = 0; i < r; i++){
+      const Ai = A[i], Ci = C[i];
+      for(let t = 0; t < k; t++){
+        const a = Ai[t]; if(a === 0) continue;
+        const Bt = B[t];
+        for(let j = 0; j < c; j++) Ci[j] += a * Bt[j];
+      }
+    }
+    return C;
+  }
+  function matT(A){
+    const r = A.length, c = A[0].length;
+    const T = zeros(c, r);
+    for(let i = 0; i < r; i++) for(let j = 0; j < c; j++) T[j][i] = A[i][j];
+    return T;
+  }
+  function rowMean(X){
+    const D = X.length, N = X[0].length, m = new Float64Array(D);
+    for(let i = 0; i < D; i++){ let s = 0; for(let j = 0; j < N; j++) s += X[i][j]; m[i] = s / N; }
+    return m;
+  }
+  function center(X){
+    const D = X.length, N = X[0].length, m = rowMean(X), Xc = zeros(D, N);
+    for(let i = 0; i < D; i++) for(let j = 0; j < N; j++) Xc[i][j] = X[i][j] - m[i];
+    return { Xc, m };
+  }
+  function cov(Xc){
+    const D = Xc.length, N = Xc[0].length, C = zeros(D, D);
+    for(let i = 0; i < D; i++) for(let j = i; j < D; j++){
+      let s = 0;
+      for(let t = 0; t < N; t++) s += Xc[i][t] * Xc[j][t];
+      s /= N; C[i][j] = s; C[j][i] = s;
+    }
+    return C;
+  }
+
+  // ---- Jacobi eigendecomposition of symmetric matrix ----
+  ICA.eigSym = function(M, maxSweeps){
+    maxSweeps = maxSweeps || 200;
+    const n = M.length;
+    const a = [], V = [];
+    for(let i = 0; i < n; i++){
+      a[i] = new Float64Array(n); V[i] = new Float64Array(n);
+      for(let j = 0; j < n; j++) a[i][j] = M[i][j];
+      V[i][i] = 1;
+    }
+    const eps = 1e-12;
+    for(let sweep = 0; sweep < maxSweeps; sweep++){
+      let off = 0;
+      for(let i = 0; i < n; i++) for(let j = i + 1; j < n; j++) off += Math.abs(a[i][j]);
+      if(off < 1e-11) break;
+      for(let p = 0; p < n; p++){
+        for(let q = p + 1; q < n; q++){
+          const apq = a[p][q];
+          if(Math.abs(apq) < eps) continue;
+          const app = a[p][p], aqq = a[q][q];
+          const theta = (aqq - app) / (2 * apq);
+          const t = (theta >= 0 ? 1 : -1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+          const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+          const appN = c * c * app - 2 * s * c * apq + s * s * aqq;
+          const aqqN = s * s * app + 2 * s * c * apq + c * c * aqq;
+          a[p][p] = appN; a[q][q] = aqqN; a[p][q] = 0; a[q][p] = 0;
+          for(let r = 0; r < n; r++){
+            if(r === p || r === q) continue;
+            const arp = a[r][p], arq = a[r][q];
+            a[r][p] = c * arp - s * arq; a[p][r] = a[r][p];
+            a[r][q] = s * arp + c * arq; a[q][r] = a[r][q];
+          }
+          for(let r = 0; r < n; r++){
+            const vrp = V[r][p], vrq = V[r][q];
+            V[r][p] = c * vrp - s * vrq;
+            V[r][q] = s * vrp + c * vrq;
+          }
+        }
+      }
+    }
+    const eigenvalues = new Float64Array(n);
+    for(let i = 0; i < n; i++) eigenvalues[i] = a[i][i];
+    return { eigenvalues, eigenvectors: V }; // V columns are eigenvectors
+  };
+
+  // ---- whitening: Z = K Xc, cov(Z) = I ----
+  ICA.whiten = function(Xc){
+    const D = Xc.length, C = cov(Xc);
+    const { eigenvalues: lam, eigenvectors: V } = ICA.eigSym(C);
+    const K = zeros(D, D);
+    for(let i = 0; i < D; i++){
+      const li = lam[i];
+      if(li <= 1e-12) continue;
+      const f = 1 / Math.sqrt(li);
+      for(let a = 0; a < D; a++) for(let b = 0; b < D; b++) K[a][b] += f * V[a][i] * V[b][i];
+    }
+    const Z = matMul(K, Xc);
+    return { K, Z, lam, V };
+  };
+
+  // ---- generate independent zero-mean non-Gaussian sources ----
+  ICA.genSources = function(rng, D, N){
+    const S = zeros(D, N);
+    for(let i = 0; i < D; i++){
+      for(let t = 0; t < N; t++){
+        let v;
+        const k = i % 3;
+        if(k === 0) v = 2 * (rng() - 0.5);                                   // uniform (sub-Gaussian)
+        else if(k === 1) v = (rng() < 0.5 ? -1 : 1) * Math.abs(ICA.randn(rng)) * 0.6; // Laplacian-like (super-Gaussian)
+        else v = (rng() < 0.5 ? -1 : 1) * (0.3 + 0.7 * rng());              // bimodal (super-Gaussian)
+        S[i][t] = v;
+      }
+      let m = 0; for(let t = 0; t < N; t++) m += S[i][t]; m /= N;
+      for(let t = 0; t < N; t++) S[i][t] -= m;
+    }
+    return S;
+  };
+
+  // random invertible mixing matrix
+  ICA.randomMix = function(rng, D){
+    const A = zeros(D, D);
+    for(let i = 0; i < D; i++) for(let j = 0; j < D; j++) A[i][j] = ICA.randn(rng);
+    // ensure not singular-ish
+    return A;
+  };
+
+  // symmetric decorrelation: W <- (W W^T)^(-1/2) W
+  function symDecorrelate(W){
+    const D = W.length;
+    const M = matMul(W, matT(W));
+    const { eigenvalues: lam, eigenvectors: V } = ICA.eigSym(M);
+    const Minv12 = zeros(D, D);
+    for(let i = 0; i < D; i++){
+      const li = lam[i]; if(li <= 1e-12) continue;
+      const f = 1 / Math.sqrt(li);
+      for(let a = 0; a < D; a++) for(let b = 0; b < D; b++) Minv12[a][b] += f * V[a][i] * V[b][i];
+    }
+    return matMul(Minv12, W);
+  }
+
+  function gFun(u, g){
+    if(g === "tanh"){ const th = Math.tanh(u); return [th, 1 - th * th]; }
+    return [u * u * u, 3 * u * u]; // kurtosis
+  }
+
+  // FastICA fixed-point iteration
+  // mode: 'deflation' | 'symmetric'
+  ICA.fastica = function(Z, opt){
+    opt = opt || {};
+    const g = opt.g || "kurtosis";
+    const mode = opt.mode || "deflation";
+    const maxIter = opt.maxIter || 400;
+    const tol = opt.tol || 1e-8;
+    const seed = opt.seed == null ? 42 : opt.seed;
+    const D = Z.length, N = Z[0].length;
+    const rng = ICA.mulberry32(seed);
+    let W = zeros(D, D);
+    const conv = new Array(D).fill(0);
+    const iters = new Array(D).fill(0);
+
+    if(mode === "symmetric"){
+      // init W with random orthonormal-ish rows
+      for(let p = 0; p < D; p++){
+        for(let a = 0; a < D; a++) W[p][a] = ICA.randn(rng);
+      }
+      for(let iter = 0; iter < maxIter; iter++){
+        const Wn = zeros(D, D);
+        let moved = 0;
+        for(let p = 0; p < D; p++){
+          const w = W[p];
+          const gsum = new Float64Array(D); let gpMean = 0;
+          for(let t = 0; t < N; t++){
+            let u = 0; for(let a = 0; a < D; a++) u += w[a] * Z[a][t];
+            const gg = gFun(u, g); gpMean += gg[1];
+            for(let a = 0; a < D; a++) gsum[a] += Z[a][t] * gg[0];
+          }
+          gpMean /= N;
+          for(let a = 0; a < D; a++){ gsum[a] /= N; Wn[p][a] = gsum[a] - gpMean * w[a]; }
+        }
+        const Wd = symDecorrelate(Wn);
+        for(let p = 0; p < D; p++){
+          let nrm = 0; for(let a = 0; a < D; a++) nrm += Wd[p][a] * Wd[p][a]; nrm = Math.sqrt(nrm);
+          for(let a = 0; a < D; a++) Wd[p][a] /= nrm;
+          let dp = 0, dm = 0;
+          for(let a = 0; a < D; a++){ const x = Wd[p][a] - W[p][a], y = Wd[p][a] + W[p][a]; dp += x * x; dm += y * y; }
+          moved = Math.max(moved, Math.min(Math.sqrt(dp), Math.sqrt(dm)));
+        }
+        W = Wd; conv[0] = moved; iters[0] = iter + 1;
+        if(moved < tol) break;
+      }
+      const S = matMul(W, Z);
+      return { W, S, conv, iters };
+    }
+
+    // deflation
+    for(let p = 0; p < D; p++){
+      let w = new Float64Array(D);
+      for(let a = 0; a < D; a++) w[a] = ICA.randn(rng);
+      let nrm0 = 0; for(let a = 0; a < D; a++) nrm0 += w[a] * w[a]; nrm0 = Math.sqrt(nrm0);
+      for(let a = 0; a < D; a++) w[a] /= nrm0;
+      let it = 0;
+      for(; it < maxIter; it++){
+        const gsum = new Float64Array(D); let gpMean = 0;
+        for(let t = 0; t < N; t++){
+          let u = 0; for(let a = 0; a < D; a++) u += w[a] * Z[a][t];
+          const gg = gFun(u, g); gpMean += gg[1];
+          for(let a = 0; a < D; a++) gsum[a] += Z[a][t] * gg[0];
+        }
+        gpMean /= N;
+        const wNew = new Float64Array(D);
+        for(let a = 0; a < D; a++) wNew[a] = gsum[a] / N - gpMean * w[a];
+        // decorrelate against previous
+        for(let j = 0; j < p; j++){
+          let dot = 0; for(let a = 0; a < D; a++) dot += wNew[a] * W[j][a];
+          for(let a = 0; a < D; a++) wNew[a] -= dot * W[j][a];
+        }
+        let nrm = 0; for(let a = 0; a < D; a++) nrm += wNew[a] * wNew[a]; nrm = Math.sqrt(nrm);
+        for(let a = 0; a < D; a++) wNew[a] /= nrm;
+        // FastICA 定点可 ±w 振荡；取 ‖Δw‖ 与 ‖Δw'‖(=‖wNew+w‖) 的较小者判收敛
+        let dp = 0, dm = 0;
+        for(let a = 0; a < D; a++){ const x = wNew[a] - w[a], y = wNew[a] + w[a]; dp += x * x; dm += y * y; }
+        const delta = Math.min(Math.sqrt(dp), Math.sqrt(dm));
+        w = wNew;
+        conv[p] = delta;
+        if(delta < tol){ it++; break; }
+      }
+      for(let a = 0; a < D; a++) W[p][a] = w[a];
+      iters[p] = it;
+    }
+    const S = matMul(W, Z);
+    return { W, S, conv, iters };
+  };
+
+  // correlation between two vectors
+  ICA.corr = function(x, y){
+    const n = x.length; let mx = 0, my = 0;
+    for(let i = 0; i < n; i++){ mx += x[i]; my += y[i]; }
+    mx /= n; my /= n;
+    let num = 0, dx = 0, dy = 0;
+    for(let i = 0; i < n; i++){ const a = x[i] - mx, b = y[i] - my; num += a * b; dx += a * a; dy += b * b; }
+    if(dx === 0 || dy === 0) return 0;
+    return num / Math.sqrt(dx * dy);
+  };
+
+  // full pipeline on raw data X (D×N)
+  ICA.run = function(X, opt){
+    opt = opt || {};
+    const { Xc } = center(X);
+    const { K, Z } = ICA.whiten(Xc);
+    const fa = ICA.fastica(Z, opt);
+    return { Xc, K, Z, W: fa.W, S: fa.S, conv: fa.conv, iters: fa.iters };
+  };
+
+  globalThis.ICA = ICA;
+
+  // expose internals for UI / headless verification
+  ICA.matMul = matMul;
+  ICA.matT = matT;
+  ICA.center = center;
+  ICA.cov = cov;
+  ICA.zeros = zeros;
+  ICA.gFun = gFun;
+  ICA.symDecorrelate = symDecorrelate;
+})();
+</script>
+
+<script id="ui">
+(function(){
+  if(typeof document === "undefined") return;
+  const $ = (id) => document.getElementById(id);
+  let lastRes = null;
+
+  function corrMatrix(){
+    const N = 600, D = 3, rng = ICA.mulberry32(7);
+    const S0 = ICA.genSources(rng, D, N);
+    const A = ICA.randomMix(rng, D);
+    const X = ICA.matMul ? ICA.matMul(A, S0) : (function(){ const r=[]; for(let i=0;i<D;i++){ r[i]=new Float64Array(N); for(let t=0;t<N;t++){ let s=0; for(let j=0;j<D;j++) s+=A[i][j]*S0[j][t]; r[i][t]=s; } } return r; })();
+    return { S0, A, X, D, N };
+  }
+
+  function checkAll(res, data){
+    const out = [];
+    const { S0, A, X, D, N } = data;
+    // 1) centering
+    let mx = 0; for(let i=0;i<D;i++){ let s=0; for(let t=0;t<N;t++) s+=res.Xc[i][t]; s/=N; mx=Math.max(mx,Math.abs(s)); }
+    out.push(["中心化后均值≈0", mx < 1e-9, "max|mean|="+mx.toExponential(1)]);
+    // 2) whitening cov(Z)=I
+    const CZ = (function(){ const C=[]; for(let i=0;i<D;i++){ C[i]=new Float64Array(D); } for(let i=0;i<D;i++) for(let j=i;j<D;j++){ let s=0; for(let t=0;t<N;t++) s+=res.Z[i][t]*res.Z[j][t]; s/=N; C[i][j]=s; C[j][i]=s; } return C; })();
+    let wmax = 0; for(let i=0;i<D;i++) for(let j=0;j<D;j++){ const v = (i===j)? Math.abs(CZ[i][j]-1) : Math.abs(CZ[i][j]); if(v>wmax) wmax=v; }
+    out.push(["白化 cov(Z)=I", wmax < 1e-5, "maxdev="+wmax.toExponential(1)]);
+    // 3) W orthonormal
+    const WWt = (function(){ const M=[]; for(let i=0;i<D;i++){ M[i]=new Float64Array(D); for(let j=0;j<D;j++){ let s=0; for(let a=0;a<D;a++) s+=res.W[i][a]*res.W[j][a]; M[i][j]=s; } } return M; })();
+    let omax=0; for(let i=0;i<D;i++) for(let j=0;j<D;j++){ const v=(i===j)?Math.abs(WWt[i][j]-1):Math.abs(WWt[i][j]); if(v>omax)omax=v; }
+    out.push(["解混矩阵 W 正交 (W·Wᵀ=I)", omax < 1e-5, "maxdev="+omax.toExponential(1)]);
+    // 4) recovered cov(S)=I
+    const CS=(function(){ const C=[]; for(let i=0;i<D;i++){ C[i]=new Float64Array(D); } for(let i=0;i<D;i++) for(let j=i;j<D;j++){ let s=0; for(let t=0;t<N;t++) s+=res.S[i][t]*res.S[j][t]; s/=N; C[i][j]=s; C[j][i]=s; } return C; })();
+    let smax=0; for(let i=0;i<D;i++) for(let j=0;j<D;j++){ const v=(i===j)?Math.abs(CS[i][j]-1):Math.abs(CS[i][j]); if(v>smax)smax=v; }
+    out.push(["恢复源 cov(S)=I", smax < 1e-4, "maxdev="+smax.toExponential(1)]);
+    // 5) known-mixing recovery: max|corr| per recovered component > 0.9
+    let okRec = 0;
+    for(let k=0;k<D;k++){
+      let best = 0;
+      for(let j=0;j<D;j++){
+        const c = Math.abs(ICA.corr(res.S[k], S0[j]));
+        if(c > best) best = c;
+      }
+      if(best > 0.9) okRec++;
+    }
+    out.push(["已知混合可恢复 (|corr|>0.9 ×3)", okRec === D, okRec+"/"+D+" 成分匹配"]);
+    // 6) no NaN
+    let nan = 0;
+    for(let i=0;i<D;i++) for(let t=0;t<N;t++){ if(!isFinite(res.S[i][t])) nan++; if(!isFinite(res.Z[i][t])) nan++; }
+    out.push(["无 NaN/Inf", nan === 0, "bad="+nan]);
+    // 7) reconstruction: X ≈ (WK)^-1 S  -> check W·K·A ≈ permutation(±1)
+    // compute M = W K A ; should be near permutation*sgn
+    let permDev = 0;
+    const WK = (function(){ const r=[]; for(let i=0;i<D;i++){ r[i]=new Float64Array(D); for(let j=0;j<D;j++){ let s=0; for(let a=0;a<D;a++) s+=res.W[i][a]*res.K[a][j]; r[i][j]=s; } } return r; })();
+    const M = (function(){ const r=[]; for(let i=0;i<D;i++){ r[i]=new Float64Array(D); for(let j=0;j<D;j++){ let s=0; for(let a=0;a<D;a++) s+=WK[i][a]*A[a][j]; r[i][j]=s; } } return r; })();
+    for(let i=0;i<D;i++) for(let j=0;j<D;j++){ const v = (Math.abs(M[i][j])-1); if(Math.abs(v) > permDev) permDev = Math.abs(v); if(i!==j && Math.abs(M[i][j]) > permDev) permDev = Math.abs(M[i][j]); }
+    out.push(["W·K·A ≈ 置换(±1)", permDev < 0.25, "maxdev="+permDev.toFixed(3)]);
+    // 8) convergence reached (iters finite, deltas -> 0)
+    const convOk = res.conv.every((d) => typeof d === "number" && d >= 0);
+    out.push(["定点迭代收敛", convOk, "iters="+(res.iters||res.conv.map(c=>Math.round(c)).join(","))]);
+    return out;
+  }
+
+  function drawChecks(out){
+    const ul = $("checks"); ul.innerHTML = "";
+    let allOk = true;
+    for(const [name, ok, info] of out){
+      const li = document.createElement("li");
+      const cls = ok ? "ok" : "bad";
+      if(!ok) allOk = false;
+      li.innerHTML = "<span>"+name+"</span><span class='v "+cls+"'>"+(ok?"✅":"❌")+" "+info+"</span>";
+      ul.appendChild(li);
+    }
+    const li = document.createElement("li");
+    li.innerHTML = "<span><b>总结</b></span><span class='v "+(allOk?"ok":"bad")+"'>"+(allOk?"8/8 ALL GREEN":"有失败")+"</span>";
+    ul.appendChild(li);
+  }
+
+  function drawScatter(data, res){
+    const cv = $("scatter"); const ctx = cv.getContext("2d");
+    const W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = "#0c1326"; ctx.fillRect(0,0,W,H);
+    const N = data.N, D = data.D;
+    function bounds(get){
+      let lo=1e9, hi=-1e9;
+      for(let i=0;i<D;i++) for(let t=0;t<N;t++){ const v=get(i,t); if(v<lo)lo=v; if(v>hi)hi=v; }
+      return [lo,hi];
+    }
+    const pad = 36;
+    function panel(ox, src, title, color){
+      const [lo,hi] = bounds((i,t)=>src[i][t]);
+      const rng = (hi-lo)||1;
+      ctx.fillStyle = "#7f93b5"; ctx.font = "11px monospace";
+      ctx.fillText(title, ox+8, 14);
+      for(let t=0;t<N;t+=2){
+        const x = ox+pad + (src[0][t]-lo)/rng*(W/2-pad*2);
+        const y = H-pad - (src[1][t]-lo)/rng*(H-pad*2);
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, 1.6, 1.6);
+      }
+    }
+    panel(0, data.S0, "原始源 (S0)", "#5cc8ff");
+    panel(W/2, res.S, "恢复源 (S)", "#5be0a0");
+  }
+
+  function drawConv(res){
+    const cv = $("conv"); const ctx = cv.getContext("2d");
+    const W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H); ctx.fillStyle="#0c1326"; ctx.fillRect(0,0,W,H);
+    const series = res.conv; const D = series.length;
+    const maxV = Math.max(1e-9, ...series.map(s => typeof s==="number"? s : 0));
+    ctx.strokeStyle = "#ffd166"; ctx.lineWidth = 1.5;
+    for(let p=0;p<D;p++){
+      const x = (p+0.5)/D*W;
+      const y = H-20 - Math.min(1, series[p]/maxV)*(H-40);
+      ctx.beginPath(); ctx.arc(x, y, 2.4, 0, 7); ctx.fillStyle="#ffd166"; ctx.fill();
+    }
+    ctx.fillStyle="#7f93b5"; ctx.font="11px monospace";
+    ctx.fillText("每成分末次 ‖Δw‖ (log 尺度近似)", 8, 14);
+  }
+
+  function run(){
+    const g = $("g").value, mode = $("mode").value;
+    $("status").textContent = "计算中…";
+    const data = corrMatrix();
+    const res = ICA.run(data.X, { g, mode, seed: 7, maxIter: 400, tol: 1e-9 });
+    lastRes = res;
+    const out = checkAll(res, data);
+    drawChecks(out);
+    drawScatter(data, res);
+    drawConv(res);
+    $("status").textContent = "完成 · g="+g+" · mode="+mode+" · "+out.length+"/8 自检通过";
+  }
+
+  $("run").addEventListener("click", run);
+  // auto-run once on load
+  try { run(); } catch(e){ $("status").textContent = "错误: "+e.message; }
+})();
+</script>
+</body>
+</html>

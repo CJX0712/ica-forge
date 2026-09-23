@@ -1,5 +1,12 @@
 # ica-forge
 
+<p align="center">
+  <a href="https://github.com/CJX0712/ica-forge/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/ica-forge/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/ica-forge/releases"><img src="https://img.shields.io/github/v/release/CJX0712/ica-forge?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/ica-forge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/ica-forge" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 > 手写 **独立成分分析 (ICA) / FastICA** —— 盲源分离的数学核心。零依赖、单文件 HTML，浏览器内一键自检 + 原生 Node 无头 **16/16 不变量全绿**。
 
 `ica-forge` 是 **forge 系列**（纯 JS 单文件手写 ML 算法实验室）的第 15 个作品。它把「从混合信号中盲分离出独立源」这一过程完整手写实现：中心化 → 协方差 → **Jacobi 特征分解** → 白化 → **FastICA 定点迭代**（kurtosis / tanh 两种对照函数，deflation / symmetric 两种模式），全部无外部依赖、无构建。
